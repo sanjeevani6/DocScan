@@ -526,14 +526,41 @@ def segment_handwriting_lines(image):
 def _crop_to_pil(gray, box):
     x1, y1, x2, y2 = box
     crop = gray[y1:y2, x1:x2]
-    lo, hi = np.percentile(crop, 1), np.percentile(crop, 99)
-    if hi - lo > 10:  # stretch contrast so faint ink becomes dark
-        crop = np.clip((crop.astype(np.float32) - lo) * 255.0 / (hi - lo),
-                       0, 255).astype(np.uint8)
-    crop = cv2.copyMakeBorder(crop, 10, 10, 10, 10,
-                              cv2.BORDER_CONSTANT, value=255)
-    return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB))
 
+    # Step 1: Stretch contrast to make faint handwriting more visible.
+    lo, hi = np.percentile(crop, 1), np.percentile(crop, 99)
+    if hi - lo > 10:
+        crop = np.clip(
+            (crop.astype(np.float32) - lo) * 255.0 / (hi - lo),
+            0, 255
+        ).astype(np.uint8)
+
+    # Step 2: Improve local contrast using CLAHE.
+    # Denoise the image while preserving handwriting strokes.
+    # Sharpen handwriting edges.
+    blur = cv2.GaussianBlur(crop, (0, 0), sigmaX=1.0)
+    crop = cv2.addWeighted(crop, 1.5, blur, -0.5, 0)
+
+    # Step 3: Reduce noise while preserving handwriting strokes.
+    # crop = cv2.fastNlMeansDenoising(
+    #     crop,
+    #     None,
+    #     h=7,
+    #     templateWindowSize=7,
+    #     searchWindowSize=21
+    # )
+
+    # Step 4: Apply mild sharpening.
+    blur = cv2.GaussianBlur(crop, (0, 0), sigmaX=1.0)
+    crop = cv2.addWeighted(crop, 1.5, blur, -0.5, 0)
+
+    # Step 5: Add white padding around the crop.
+    crop = cv2.copyMakeBorder(
+        crop, 10, 10, 10, 10,
+        cv2.BORDER_CONSTANT, value=255
+    )
+
+    return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB))
 
 def _recognize_batch(images):
     import torch
@@ -551,6 +578,69 @@ def _recognize_batch(images):
         )
     return [t.strip() for t in
             processor.batch_decode(ids, skip_special_tokens=True)]
+
+
+
+
+def _is_allcaps_line(ink_crop):
+    """Return True when the line looks like ALL-CAPS handwriting.
+
+    All-caps letters have uniform height (no tall ascenders or deep
+    descenders), so the per-column ink span has a low coefficient of
+    variation compared to mixed-case text.
+    """
+    h, w = ink_crop.shape
+    spans = []
+    for col in range(w):
+        ys = np.where(ink_crop[:, col] > 0)[0]
+        if len(ys) >= 2:
+            spans.append(int(ys[-1]) - int(ys[0]))
+    if len(spans) < max(5, int(0.1 * w)):
+        return False
+    spans = np.array(spans, dtype=np.float32)
+    cv = float(np.std(spans)) / (float(np.mean(spans)) + 1e-6)
+    return cv < 0.35
+
+
+def _tesseract_single_line(pil_img):
+    """Run Tesseract in single-line mode (PSM 7) on a PIL image."""
+    text = pytesseract.image_to_string(
+        pil_img,
+        lang=config.OCR_LANG,
+        config="--oem 1 --psm 7"
+    )
+    return text.strip().rstrip('\x0c').strip()
+
+
+_spell = None
+
+
+def _spellcheck_line(text):
+    """Fix non-word OCR errors using pyspellchecker (if installed).
+
+    Only corrects tokens that are not in the dictionary; real words
+    that are merely wrong in context (e.g. 'official' vs 'optical')
+    are left unchanged — a spell-checker cannot know the intended word.
+    """
+    global _spell
+    try:
+        if _spell is None:
+            from spellchecker import SpellChecker
+            _spell = SpellChecker()
+        words = text.split()
+        corrected = []
+        for w in words:
+            alpha = ''.join(c for c in w if c.isalpha())
+            if alpha and alpha.lower() not in _spell:
+                candidate = _spell.correction(alpha)
+                if candidate:
+                    suffix = w[len(alpha):]
+                    corrected.append(candidate + suffix)
+                    continue
+            corrected.append(w)
+        return ' '.join(corrected)
+    except ImportError:
+        return text  # pyspellchecker not installed — pass through
 
 
 def recognize_handwriting(image_path, progress_cb=None):
@@ -588,18 +678,39 @@ def recognize_handwriting(image_path, progress_cb=None):
         cv2.putText(preview, str(li + 1), (max(0, boxes[0][0]), boxes[0][1] + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    crops = [_crop_to_pil(gray, box) for _, box in pieces]
-    texts = []
+    # Classify each piece: all-caps lines go to Tesseract, others to TrOCR.
+    pil_crops, use_tess = [], []
+    for _, box in pieces:
+        x1, y1, x2, y2 = box
+        raw = gray[y1:y2, x1:x2]
+        _, ink = cv2.threshold(raw, 0, 255,
+                               cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        pil_crops.append(_crop_to_pil(gray, box))
+        use_tess.append(_is_allcaps_line(ink))
+
+    texts = [None] * len(pil_crops)
+
+    # TrOCR batch for mixed-case lines.
+    trocr_idxs = [i for i, f in enumerate(use_tess) if not f]
+    trocr_crops = [pil_crops[i] for i in trocr_idxs]
+    trocr_texts = []
     bs = config.HANDWRITING_BATCH_SIZE
-    for start in range(0, len(crops), bs):
-        texts.extend(_recognize_batch(crops[start:start + bs]))
+    for start in range(0, len(trocr_crops), bs):
+        trocr_texts.extend(_recognize_batch(trocr_crops[start:start + bs]))
         if progress_cb:
-            progress_cb(min(start + bs, len(crops)), len(crops),
+            progress_cb(min(start + bs, len(pil_crops)), len(pil_crops),
                         "Recognizing handwriting")
+    for i, t in zip(trocr_idxs, trocr_texts):
+        texts[i] = _spellcheck_line(t)
+
+    # Tesseract for all-caps lines.
+    for i in [i for i, f in enumerate(use_tess) if f]:
+        texts[i] = _tesseract_single_line(pil_crops[i])
+        print(f"[INFO] Line {i+1} routed to Tesseract (all-caps detected)")
 
     per_line = {}
     for (li, _), text in zip(pieces, texts):
-        per_line.setdefault(li, []).append(text)
+        per_line.setdefault(li, []).append(text or "")
     result = [" ".join(t for t in per_line[i] if t) for i in sorted(per_line)]
     return "\n".join(r for r in result if r), preview
 

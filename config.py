@@ -43,7 +43,7 @@ EASYOCR_LANGS = os.environ.get("EASYOCR_LANGS", "en").split(",")
 # --------------------------------------------------------------------------
 # "auto" -> large model when a CUDA GPU exists, base model on CPU.
 HANDWRITING_MODEL = os.environ.get("HANDWRITING_MODEL", "auto")
-HANDWRITING_BASE = "microsoft/trocr-base-handwritten"
+HANDWRITING_BASE = "microsoft/trocr-large-handwritten"
 HANDWRITING_LARGE = "microsoft/trocr-large-handwritten"
 HANDWRITING_BATCH_SIZE = 8
 HANDWRITING_NUM_BEAMS = 5

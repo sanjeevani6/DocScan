@@ -264,7 +264,9 @@ class OCRApp(ctk.CTk):
             fg_color="#FFFFFF",
             text_color="#182235",
             font=("Consolas", 13),
-            wrap="word"
+            wrap="word",
+            height=200,
+            activate_scrollbars=True
         )
         self.text_box.grid(
             row=4, column=0, columnspan=2,
